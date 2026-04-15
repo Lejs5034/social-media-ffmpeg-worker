@@ -103,10 +103,7 @@ app.post("/mix-video", async (req, res) => {
       await fs.ensureDir(workdir);
 
       try {
-        const audioBg = path.join(workdir, "bg.mp3");
         const audioVoice = path.join(workdir, "voice.mp3");
-
-        await downloadFile(background_url, audioBg);
         await downloadFile(voice_url, audioVoice);
 
         const voiceDuration = await getAudioDuration(audioVoice);
@@ -124,83 +121,43 @@ app.post("/mix-video", async (req, res) => {
           localMedia.push({ path: target, isVideo });
         }
 
-        const perItemDuration = voiceDuration / localMedia.length;
-        const clipPaths = [];
-
-        for (let i = 0; i < localMedia.length; i++) {
-          const item = localMedia[i];
-          const out = path.join(workdir, `clip-${i}.mp4`);
-
-          if (item.isVideo) {
-            await runFfmpeg(
-              ffmpeg(item.path)
-                .videoCodec("libx264")
-                .outputOptions([
-                  `-t ${perItemDuration}`,
-                  "-pix_fmt yuv420p",
-                  "-preset ultrafast",
-                  "-movflags +faststart",
-                  "-r 20",
-                  "-vf scale=540:960:force_original_aspect_ratio=decrease,pad=540:960:(ow-iw)/2:(oh-ih)/2:black,fps=20",
-                ])
-                .noAudio()
-                .save(out)
-            );
-          } else {
-            await runFfmpeg(
-              ffmpeg(item.path)
-                .inputOptions(["-loop 1"])
-                .videoCodec("libx264")
-                .outputOptions([
-                  `-t ${perItemDuration}`,
-                  "-pix_fmt yuv420p",
-                  "-preset ultrafast",
-                  "-movflags +faststart",
-                  "-r 20",
-                  "-vf scale=540:960:force_original_aspect_ratio=decrease,pad=540:960:(ow-iw)/2:(oh-ih)/2:black,fps=20",
-                ])
-                .noAudio()
-                .save(out)
-            );
-          }
-
-          clipPaths.push(out);
-        }
-
-        const concatFile = path.join(workdir, "concat.txt");
-        const concatContent = clipPaths
-          .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
-          .join("\n");
-        await fs.writeFile(concatFile, concatContent, "utf8");
-
-        const mergedVideo = path.join(workdir, "merged-video.mp4");
-        await runFfmpeg(
-          ffmpeg()
-            .input(concatFile)
-            .inputOptions(["-f concat", "-safe 0"])
-            .outputOptions([
-              "-c:v libx264",
-              "-pix_fmt yuv420p",
-              "-preset ultrafast",
-              "-movflags +faststart",
-            ])
-            .noAudio()
-            .save(mergedVideo)
-        );
-
+        const firstItem = localMedia[0];
         const finalVideo = path.join(workdir, `final-${jobId}.mp4`);
-        await runFfmpeg(
-          ffmpeg()
-            .input(mergedVideo)
-            .input(audioVoice)
-            .outputOptions([
-              "-c:v copy",
-              "-c:a aac",
-              "-shortest",
-              "-movflags +faststart",
-            ])
-            .save(finalVideo)
-        );
+
+        if (firstItem.isVideo) {
+          await runFfmpeg(
+            ffmpeg(firstItem.path)
+              .input(audioVoice)
+              .outputOptions([
+                "-t " + voiceDuration,
+                "-c:v libx264",
+                "-preset ultrafast",
+                "-pix_fmt yuv420p",
+                "-vf scale=540:960:force_original_aspect_ratio=decrease,pad=540:960:(ow-iw)/2:(oh-ih)/2:black,fps=20",
+                "-c:a aac",
+                "-shortest",
+                "-movflags +faststart",
+              ])
+              .save(finalVideo)
+          );
+        } else {
+          await runFfmpeg(
+            ffmpeg(firstItem.path)
+              .inputOptions(["-loop 1"])
+              .input(audioVoice)
+              .outputOptions([
+                "-t " + voiceDuration,
+                "-c:v libx264",
+                "-preset ultrafast",
+                "-pix_fmt yuv420p",
+                "-vf scale=540:960:force_original_aspect_ratio=decrease,pad=540:960:(ow-iw)/2:(oh-ih)/2:black,fps=20",
+                "-c:a aac",
+                "-shortest",
+                "-movflags +faststart",
+              ])
+              .save(finalVideo)
+          );
+        }
 
         const objectName = `final-videos/final-${jobId}.mp4`;
         const publicUrl = await uploadToGCS(finalVideo, objectName);
