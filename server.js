@@ -65,9 +65,6 @@ async function uploadToGCS(localPath, objectName) {
     contentType: "video/mp4",
   });
 
-  const file = bucket.file(objectName);
-  await file.makePublic();
-
   return `https://storage.googleapis.com/${BUCKET_NAME}/${objectName}`;
 }
 
@@ -129,7 +126,7 @@ app.post("/mix-video", async (req, res) => {
             ffmpeg(firstItem.path)
               .input(audioVoice)
               .outputOptions([
-                "-t " + voiceDuration,
+                `-t ${voiceDuration}`,
                 "-c:v libx264",
                 "-preset ultrafast",
                 "-pix_fmt yuv420p",
@@ -146,7 +143,7 @@ app.post("/mix-video", async (req, res) => {
               .inputOptions(["-loop 1"])
               .input(audioVoice)
               .outputOptions([
-                "-t " + voiceDuration,
+                `-t ${voiceDuration}`,
                 "-c:v libx264",
                 "-preset ultrafast",
                 "-pix_fmt yuv420p",
