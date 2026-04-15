@@ -67,7 +67,6 @@ async function uploadToGCS(localPath, objectName) {
 
   const file = bucket.file(objectName);
 
-  // Datei öffentlich machen
   await file.makePublic();
 
   return `https://storage.googleapis.com/${BUCKET_NAME}/${objectName}`;
@@ -142,8 +141,8 @@ app.post("/mix-video", async (req, res) => {
                   "-pix_fmt yuv420p",
                   "-preset veryfast",
                   "-movflags +faststart",
-                  "-r 30",
-                  "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30"
+                  "-r 24",
+                  "-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=24"
                 ])
                 .noAudio()
                 .save(out)
@@ -158,8 +157,8 @@ app.post("/mix-video", async (req, res) => {
                   "-pix_fmt yuv420p",
                   "-preset veryfast",
                   "-movflags +faststart",
-                  "-r 30",
-                  "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30"
+                  "-r 24",
+                  "-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=24"
                 ])
                 .noAudio()
                 .save(out)
@@ -196,7 +195,7 @@ app.post("/mix-video", async (req, res) => {
             .input(audioBg)
             .input(audioVoice)
             .complexFilter([
-              "[0:a]volume=0.12,aloop=loop=-1:size=2e+09[bg]",
+              "[0:a]volume=0.12[bg]",
               "[1:a]volume=1.0[voice]",
               "[bg][voice]amix=inputs=2:duration=first:dropout_transition=2[aout]"
             ])
