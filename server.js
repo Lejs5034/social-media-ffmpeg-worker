@@ -66,7 +66,6 @@ async function uploadToGCS(localPath, objectName) {
   });
 
   const file = bucket.file(objectName);
-
   await file.makePublic();
 
   return `https://storage.googleapis.com/${BUCKET_NAME}/${objectName}`;
@@ -139,10 +138,10 @@ app.post("/mix-video", async (req, res) => {
                 .outputOptions([
                   `-t ${perItemDuration}`,
                   "-pix_fmt yuv420p",
-                  "-preset veryfast",
+                  "-preset ultrafast",
                   "-movflags +faststart",
-                  "-r 24",
-                  "-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=24"
+                  "-r 20",
+                  "-vf scale=540:960:force_original_aspect_ratio=decrease,pad=540:960:(ow-iw)/2:(oh-ih)/2:black,fps=20",
                 ])
                 .noAudio()
                 .save(out)
@@ -155,10 +154,10 @@ app.post("/mix-video", async (req, res) => {
                 .outputOptions([
                   `-t ${perItemDuration}`,
                   "-pix_fmt yuv420p",
-                  "-preset veryfast",
+                  "-preset ultrafast",
                   "-movflags +faststart",
-                  "-r 24",
-                  "-vf scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black,fps=24"
+                  "-r 20",
+                  "-vf scale=540:960:force_original_aspect_ratio=decrease,pad=540:960:(ow-iw)/2:(oh-ih)/2:black,fps=20",
                 ])
                 .noAudio()
                 .save(out)
@@ -182,37 +181,23 @@ app.post("/mix-video", async (req, res) => {
             .outputOptions([
               "-c:v libx264",
               "-pix_fmt yuv420p",
-              "-preset veryfast",
-              "-movflags +faststart"
+              "-preset ultrafast",
+              "-movflags +faststart",
             ])
             .noAudio()
             .save(mergedVideo)
-        );
-
-        const mixedAudio = path.join(workdir, "mixed-audio.mp3");
-        await runFfmpeg(
-          ffmpeg()
-            .input(audioBg)
-            .input(audioVoice)
-            .complexFilter([
-              "[0:a]volume=0.12[bg]",
-              "[1:a]volume=1.0[voice]",
-              "[bg][voice]amix=inputs=2:duration=first:dropout_transition=2[aout]"
-            ])
-            .outputOptions(["-map [aout]"])
-            .save(mixedAudio)
         );
 
         const finalVideo = path.join(workdir, `final-${jobId}.mp4`);
         await runFfmpeg(
           ffmpeg()
             .input(mergedVideo)
-            .input(mixedAudio)
+            .input(audioVoice)
             .outputOptions([
               "-c:v copy",
               "-c:a aac",
               "-shortest",
-              "-movflags +faststart"
+              "-movflags +faststart",
             ])
             .save(finalVideo)
         );
