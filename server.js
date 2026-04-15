@@ -7,14 +7,14 @@ import os from "os";
 import { v4 as uuidv4 } from "uuid";
 import { Storage } from "@google-cloud/storage";
 
+ffmpeg.setFfmpegPath("/usr/bin/ffmpeg");
+
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 const PORT = process.env.PORT || 3000;
 const BUCKET_NAME = process.env.GCS_BUCKET_NAME;
 const GCS_PROJECT_ID = process.env.GCS_PROJECT_ID;
-
-// Service Account JSON komplett als String in Railway Variable speichern
 const GCS_KEY_JSON = process.env.GCS_KEY_JSON;
 
 if (!BUCKET_NAME || !GCS_PROJECT_ID || !GCS_KEY_JSON) {
@@ -34,6 +34,7 @@ async function downloadFile(url, outputPath) {
     url,
     responseType: "stream",
     timeout: 120000,
+    maxRedirects: 5,
   });
 
   await fs.ensureDir(path.dirname(outputPath));
@@ -49,6 +50,7 @@ async function downloadFile(url, outputPath) {
 function runFfmpeg(command) {
   return new Promise((resolve, reject) => {
     command
+      .on("start", (cmd) => console.log("FFmpeg command:", cmd))
       .on("end", resolve)
       .on("error", reject)
       .run();
@@ -57,13 +59,27 @@ function runFfmpeg(command) {
 
 async function uploadToGCS(localPath, objectName) {
   const bucket = storage.bucket(BUCKET_NAME);
+
   await bucket.upload(localPath, {
     destination: objectName,
     contentType: "video/mp4",
   });
 
-  // Einfachste brauchbare URL
+  const file = bucket.file(objectName);
+
+  // Datei öffentlich machen
+  await file.makePublic();
+
   return `https://storage.googleapis.com/${BUCKET_NAME}/${objectName}`;
+}
+
+async function getAudioDuration(audioPath) {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(audioPath, (err, metadata) => {
+      if (err) return reject(err);
+      resolve(metadata.format.duration || 0);
+    });
+  });
 }
 
 app.get("/health", (_req, res) => {
@@ -84,7 +100,6 @@ app.post("/mix-video", async (req, res) => {
     const jobId = Date.now().toString();
     jobs.set(jobId, { status: "processing" });
 
-    // async weiterlaufen lassen
     (async () => {
       const workdir = path.join(os.tmpdir(), `job-${jobId}-${uuidv4()}`);
       await fs.ensureDir(workdir);
@@ -96,51 +111,55 @@ app.post("/mix-video", async (req, res) => {
         await downloadFile(background_url, audioBg);
         await downloadFile(voice_url, audioVoice);
 
-        const localMedia = [];
-
-        for (let i = 0; i < media_list.length; i++) {
-          const ext = media_list[i].includes(".mp4") ? "mp4" : "jpg";
-          const target = path.join(workdir, `media-${i}.${ext}`);
-          await downloadFile(media_list[i], target);
-          localMedia.push(target);
+        const voiceDuration = await getAudioDuration(audioVoice);
+        if (!voiceDuration || voiceDuration <= 0) {
+          throw new Error("Could not determine voice audio duration");
         }
 
-        // 1) Bilder zu kurzen Clips machen, Videos direkt übernehmen
+        const localMedia = [];
+        for (let i = 0; i < media_list.length; i++) {
+          const srcUrl = media_list[i];
+          const isVideo = srcUrl.toLowerCase().includes(".mp4");
+          const ext = isVideo ? "mp4" : "jpg";
+          const target = path.join(workdir, `media-${i}.${ext}`);
+          await downloadFile(srcUrl, target);
+          localMedia.push({ path: target, isVideo });
+        }
+
+        const perItemDuration = voiceDuration / localMedia.length;
         const clipPaths = [];
 
         for (let i = 0; i < localMedia.length; i++) {
-          const src = localMedia[i];
-          const isVideo = src.endsWith(".mp4");
+          const item = localMedia[i];
           const out = path.join(workdir, `clip-${i}.mp4`);
 
-          if (isVideo) {
-            // Normalisieren
+          if (item.isVideo) {
             await runFfmpeg(
-              ffmpeg(src)
+              ffmpeg(item.path)
                 .videoCodec("libx264")
                 .outputOptions([
+                  `-t ${perItemDuration}`,
                   "-pix_fmt yuv420p",
                   "-preset veryfast",
                   "-movflags +faststart",
                   "-r 30",
-                  "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+                  "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30"
                 ])
                 .noAudio()
                 .save(out)
             );
           } else {
-            // Bild 3 Sekunden stehen lassen
             await runFfmpeg(
-              ffmpeg(src)
+              ffmpeg(item.path)
                 .inputOptions(["-loop 1"])
                 .videoCodec("libx264")
                 .outputOptions([
-                  "-t 3",
+                  `-t ${perItemDuration}`,
                   "-pix_fmt yuv420p",
                   "-preset veryfast",
                   "-movflags +faststart",
                   "-r 30",
-                  "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+                  "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30"
                 ])
                 .noAudio()
                 .save(out)
@@ -150,9 +169,10 @@ app.post("/mix-video", async (req, res) => {
           clipPaths.push(out);
         }
 
-        // 2) Concat-Datei bauen
         const concatFile = path.join(workdir, "concat.txt");
-        const concatContent = clipPaths.map(p => `file '${p}'`).join("\n");
+        const concatContent = clipPaths
+          .map((p) => `file '${p.replace(/'/g, "'\\''")}'`)
+          .join("\n");
         await fs.writeFile(concatFile, concatContent, "utf8");
 
         const mergedVideo = path.join(workdir, "merged-video.mp4");
@@ -170,22 +190,20 @@ app.post("/mix-video", async (req, res) => {
             .save(mergedVideo)
         );
 
-        // 3) Voice + Background mischen
         const mixedAudio = path.join(workdir, "mixed-audio.mp3");
         await runFfmpeg(
           ffmpeg()
             .input(audioBg)
             .input(audioVoice)
             .complexFilter([
-              "[0:a]volume=0.15[bg]",
+              "[0:a]volume=0.12,aloop=loop=-1:size=2e+09[bg]",
               "[1:a]volume=1.0[voice]",
-              "[bg][voice]amix=inputs=2:duration=longest[aout]"
+              "[bg][voice]amix=inputs=2:duration=first:dropout_transition=2[aout]"
             ])
             .outputOptions(["-map [aout]"])
             .save(mixedAudio)
         );
 
-        // 4) Finale Datei erzeugen
         const finalVideo = path.join(workdir, `final-${jobId}.mp4`);
         await runFfmpeg(
           ffmpeg()
@@ -200,7 +218,6 @@ app.post("/mix-video", async (req, res) => {
             .save(finalVideo)
         );
 
-        // 5) Upload zu GCS
         const objectName = `final-videos/final-${jobId}.mp4`;
         const publicUrl = await uploadToGCS(finalVideo, objectName);
 
@@ -211,6 +228,7 @@ app.post("/mix-video", async (req, res) => {
 
         await fs.remove(workdir);
       } catch (err) {
+        console.error("Job failed:", err);
         jobs.set(jobId, {
           status: "error",
           error: err.message,
