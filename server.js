@@ -1,0 +1,277 @@
+import express from "express";
+import axios from "axios";
+import ffmpeg from "fluent-ffmpeg";
+import fs from "fs-extra";
+import path from "path";
+import os from "os";
+import { v4 as uuidv4 } from "uuid";
+import { Storage } from "@google-cloud/storage";
+
+const app = express();
+app.use(express.json({ limit: "10mb" }));
+
+const PORT = process.env.PORT || 3000;
+const BUCKET_NAME = process.env.GCS_BUCKET_NAME;
+const GCS_PROJECT_ID = process.env.GCS_PROJECT_ID;
+
+// Service Account JSON komplett als String in Railway Variable speichern
+const GCS_KEY_JSON = process.env.GCS_KEY_JSON;
+
+if (!BUCKET_NAME || !GCS_PROJECT_ID || !GCS_KEY_JSON) {
+  console.warn("Missing GCS env vars");
+}
+
+const storage = new Storage({
+  projectId: GCS_PROJECT_ID,
+  credentials: JSON.parse(GCS_KEY_JSON || "{}"),
+});
+
+const jobs = new Map();
+
+async function downloadFile(url, outputPath) {
+  const response = await axios({
+    method: "GET",
+    url,
+    responseType: "stream",
+    timeout: 120000,
+  });
+
+  await fs.ensureDir(path.dirname(outputPath));
+
+  await new Promise((resolve, reject) => {
+    const writer = fs.createWriteStream(outputPath);
+    response.data.pipe(writer);
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+  });
+}
+
+function runFfmpeg(command) {
+  return new Promise((resolve, reject) => {
+    command
+      .on("end", resolve)
+      .on("error", reject)
+      .run();
+  });
+}
+
+async function uploadToGCS(localPath, objectName) {
+  const bucket = storage.bucket(BUCKET_NAME);
+  await bucket.upload(localPath, {
+    destination: objectName,
+    contentType: "video/mp4",
+  });
+
+  // Einfachste brauchbare URL
+  return `https://storage.googleapis.com/${BUCKET_NAME}/${objectName}`;
+}
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
+
+app.post("/mix-video", async (req, res) => {
+  try {
+    const { background_url, media_list, voice_url } = req.body?.data || {};
+
+    if (!background_url || !Array.isArray(media_list) || media_list.length === 0 || !voice_url) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing required fields",
+      });
+    }
+
+    const jobId = Date.now().toString();
+    jobs.set(jobId, { status: "processing" });
+
+    // async weiterlaufen lassen
+    (async () => {
+      const workdir = path.join(os.tmpdir(), `job-${jobId}-${uuidv4()}`);
+      await fs.ensureDir(workdir);
+
+      try {
+        const audioBg = path.join(workdir, "bg.mp3");
+        const audioVoice = path.join(workdir, "voice.mp3");
+
+        await downloadFile(background_url, audioBg);
+        await downloadFile(voice_url, audioVoice);
+
+        const localMedia = [];
+
+        for (let i = 0; i < media_list.length; i++) {
+          const ext = media_list[i].includes(".mp4") ? "mp4" : "jpg";
+          const target = path.join(workdir, `media-${i}.${ext}`);
+          await downloadFile(media_list[i], target);
+          localMedia.push(target);
+        }
+
+        // 1) Bilder zu kurzen Clips machen, Videos direkt übernehmen
+        const clipPaths = [];
+
+        for (let i = 0; i < localMedia.length; i++) {
+          const src = localMedia[i];
+          const isVideo = src.endsWith(".mp4");
+          const out = path.join(workdir, `clip-${i}.mp4`);
+
+          if (isVideo) {
+            // Normalisieren
+            await runFfmpeg(
+              ffmpeg(src)
+                .videoCodec("libx264")
+                .outputOptions([
+                  "-pix_fmt yuv420p",
+                  "-preset veryfast",
+                  "-movflags +faststart",
+                  "-r 30",
+                  "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+                ])
+                .noAudio()
+                .save(out)
+            );
+          } else {
+            // Bild 3 Sekunden stehen lassen
+            await runFfmpeg(
+              ffmpeg(src)
+                .inputOptions(["-loop 1"])
+                .videoCodec("libx264")
+                .outputOptions([
+                  "-t 3",
+                  "-pix_fmt yuv420p",
+                  "-preset veryfast",
+                  "-movflags +faststart",
+                  "-r 30",
+                  "-vf scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+                ])
+                .noAudio()
+                .save(out)
+            );
+          }
+
+          clipPaths.push(out);
+        }
+
+        // 2) Concat-Datei bauen
+        const concatFile = path.join(workdir, "concat.txt");
+        const concatContent = clipPaths.map(p => `file '${p}'`).join("\n");
+        await fs.writeFile(concatFile, concatContent, "utf8");
+
+        const mergedVideo = path.join(workdir, "merged-video.mp4");
+        await runFfmpeg(
+          ffmpeg()
+            .input(concatFile)
+            .inputOptions(["-f concat", "-safe 0"])
+            .outputOptions([
+              "-c:v libx264",
+              "-pix_fmt yuv420p",
+              "-preset veryfast",
+              "-movflags +faststart"
+            ])
+            .noAudio()
+            .save(mergedVideo)
+        );
+
+        // 3) Voice + Background mischen
+        const mixedAudio = path.join(workdir, "mixed-audio.mp3");
+        await runFfmpeg(
+          ffmpeg()
+            .input(audioBg)
+            .input(audioVoice)
+            .complexFilter([
+              "[0:a]volume=0.15[bg]",
+              "[1:a]volume=1.0[voice]",
+              "[bg][voice]amix=inputs=2:duration=longest[aout]"
+            ])
+            .outputOptions(["-map [aout]"])
+            .save(mixedAudio)
+        );
+
+        // 4) Finale Datei erzeugen
+        const finalVideo = path.join(workdir, `final-${jobId}.mp4`);
+        await runFfmpeg(
+          ffmpeg()
+            .input(mergedVideo)
+            .input(mixedAudio)
+            .outputOptions([
+              "-c:v copy",
+              "-c:a aac",
+              "-shortest",
+              "-movflags +faststart"
+            ])
+            .save(finalVideo)
+        );
+
+        // 5) Upload zu GCS
+        const objectName = `final-videos/final-${jobId}.mp4`;
+        const publicUrl = await uploadToGCS(finalVideo, objectName);
+
+        jobs.set(jobId, {
+          status: "done",
+          url: publicUrl,
+        });
+
+        await fs.remove(workdir);
+      } catch (err) {
+        jobs.set(jobId, {
+          status: "error",
+          error: err.message,
+        });
+      }
+    })();
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        id: jobId,
+        status: "processing",
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      error: "Something broke",
+      details: err.message,
+    });
+  }
+});
+
+app.get("/video-status", async (req, res) => {
+  try {
+    const { id } = req.query;
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        error: "Missing id",
+      });
+    }
+
+    const job = jobs.get(id);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: "Job not found",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        id,
+        status: job.status,
+        url: job.url || null,
+        error: job.error || null,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      error: "Something broke",
+      details: err.message,
+    });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server listening on ${PORT}`);
+});
